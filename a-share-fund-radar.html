@@ -71,7 +71,32 @@ function scoreClass(n){return n>=80?'hot':n>=60?'warm':n>=40?'cool':''}
 function scoreLabel(n){return n>=80?'强势':n>=60?'偏强':n>=40?'观察':'偏弱'}
 function makeAlerts(items){const now=Date.now(),alerts=[];for(const x of items){const old=sectorHistory[x.code]||[],prev=old[old.length-1];const history=[...old,{t:now,net:x.net,score:x.score,change:x.change}].slice(-5);sectorHistory[x.code]=history;const freshPrev=prev&&now-prev.t<=150000;const delta=freshPrev?x.net-prev.net:0;const candidates=[];if(freshPrev&&delta>Math.max(50000000,x.amount*.012))candidates.push(['资金加速流入','较上次刷新增加 '+money(delta),'good']);if(freshPrev&&prev.net>0&&x.net<0)candidates.push(['资金由流入转流出','当前主力净流入 '+money(x.net),'critical']);if(x.change>=2&&x.net<0)candidates.push(['涨幅与资金背离','板块上涨 '+pct(x.change)+'，主力净流出 '+money(x.net),'critical']);if(history.length>=3&&history.slice(-3).every(h=>h.net>0&&now-h.t<=180000)&&x.score>=60)candidates.push(['连续刷新净流入','最近3次快照主力净流入均为正','good']);if(x.score>=88&&x.net>0)candidates.push(['板块强度突出','综合强度 '+x.score+' 分，主力资金净流入','good']);for(const c of candidates){const key=x.code+'_'+c[0],last=alertCooldown[key]||0;if(now-last>10*60*1000){alerts.push({name:x.name,title:c[0],desc:c[1],tone:c[2],time:new Date(now).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})});alertCooldown[key]=now}}}saveRadarState();alerts.sort((a,b)=>(a.tone==='critical'?-1:1));const top=alerts.slice(0,12);$('alertCount').textContent=top.length?top.length+' 条新提醒':'暂无新提醒';$('alertList').innerHTML=top.length?top.map(a=>'<div class="alert-item '+a.tone+'"><div class="alert-title">'+safe(a.name)+' · '+safe(a.title)+'</div><div class="alert-desc">'+safe(a.desc)+' · '+safe(a.time)+'</div></div>').join(''):'<div class="empty">本轮未发现新的异动条件。保持网页打开并允许每60秒刷新，才能持续比较资金变化。</div>'}
 
-async function getJson(url){const c=new AbortController(),t=setTimeout(()=>c.abort(),12000);try{const r=await fetch(url,{signal:c.signal,cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);return await r.json()}finally{clearTimeout(t)}}
+function normalizeRows(diff){
+ if(Array.isArray(diff))return diff;
+ if(diff&&typeof diff==='object')return Object.keys(diff).sort((a,b)=>Number(a)-Number(b)).map(k=>diff[k]);
+ return null;
+}
+function requestJsonp(url,timeoutMs=10000){
+ return new Promise((resolve,reject)=>{
+  const cb='__radar_cb_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2);
+  const script=document.createElement('script');let settled=false;
+  const timer=setTimeout(()=>finish(new Error('JSONP请求超时')),timeoutMs);
+  function finish(err,data){if(settled)return;settled=true;clearTimeout(timer);try{delete window[cb]}catch(e){window[cb]=undefined}script.remove();if(err)reject(err);else resolve(data)}
+  window[cb]=data=>finish(null,data);script.onerror=()=>finish(new Error('JSONP跨域请求失败'));
+  try{const u=new URL(url);u.searchParams.set('cb',cb);u.searchParams.set('_',String(Date.now()));script.src=u.toString();document.head.appendChild(script)}catch(e){finish(e)}
+ });
+}
+async function requestFetch(url){const c=new AbortController(),t=setTimeout(()=>c.abort(),10000);try{const r=await fetch(url,{signal:c.signal,cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);return await r.json()}finally{clearTimeout(t)}}
+async function getJson(url){
+ const candidates=[url];
+ try{const u=new URL(url);if(u.hostname==='push2.eastmoney.com'&&u.pathname.includes('/api/qt/clist/get')){u.hostname='push2delay.eastmoney.com';candidates.push(u.toString())}}catch(e){}
+ let lastError;
+ for(const candidate of candidates){
+  try{return await requestJsonp(candidate)}catch(e){lastError=e}
+  try{return await requestFetch(candidate)}catch(e){lastError=e}
+ }
+ throw new Error((lastError&&lastError.message)||'数据源暂不可达（跨域或网络限制）');
+}
 async function loadSectors(){
  if(busy)return;busy=true;$('status').textContent='更新中';$('refresh').disabled=true;
  try{
@@ -80,8 +105,8 @@ async function loadSectors(){
   const pageSize=40, all=[];
   for(let pn=1;pn<=30;pn++){
    const url=API+'?pn='+pn+'&pz='+pageSize+'&po=1&np=1&fltt=2&invt=2&fid=f6&fs='+encodeURIComponent(fs)+'&fields=f12,f14,f2,f3,f62,f184,f6,f104,f105&_='+Date.now();
-   const j=await getJson(url),list=j?.data?.diff;
-   if(!Array.isArray(list))throw Error('板块数据格式异常（第'+pn+'页）');
+   const j=await getJson(url),list=normalizeRows(j?.data?.diff);
+   if(!list)throw Error('板块数据格式异常（第'+pn+'页）');
    all.push(...list);
    if(list.length<pageSize)break;
   }
@@ -98,7 +123,7 @@ async function loadSectors(){
   $('updated').textContent='按板块当日成交额排序 · '+(view==='all'?'显示全部 '+visible.length+' 个':'仅显示前30个')+' · '+new Date().toLocaleTimeString('zh-CN');
   $('status').textContent='数据已更新';
   document.querySelectorAll('.sectorrow').forEach(row=>row.addEventListener('click',()=>openSector(row.dataset.code,row.dataset.name)));
- }catch(e){$('status').textContent='连接失败';$('rows').innerHTML='<tr><td colspan="4" class="empty">数据读取失败：'+safe(e.message)+'。请稍后重试或检查网络限制。</td></tr>'}
+ }catch(e){$('status').textContent='连接失败';$('rows').innerHTML='<tr><td colspan="5" class="empty">数据读取失败：'+safe(e.message)+'。已尝试 JSONP、浏览器请求及备用行情节点，请稍后重试或检查网络限制。</td></tr>'}
  finally{busy=false;$('refresh').disabled=false}
 }
 function switchTab(tab){
@@ -120,7 +145,7 @@ async function loadStocks(){
  if(!selected)return;
  try{
   const url=API+'?pn=1&pz=100&po=1&np=1&fltt=2&invt=2&fid=f62&fs='+encodeURIComponent('b:'+selected.code)+'&fields=f12,f14,f2,f3,f6,f62&_='+Date.now();
-  const j=await getJson(url),list=j?.data?.diff;if(!Array.isArray(list))throw Error('接口未返回成分股');
+  const j=await getJson(url),list=normalizeRows(j?.data?.diff);if(!list)throw Error('接口未返回成分股');
   const rows=list.map(x=>({code:x.f12,name:x.f14,price:Number(x.f2),change:Number(x.f3),amount:Number(x.f6),net:Number(x.f62)}));
   if(!rows.length)throw Error('该板块暂无成分股数据');
   selectedStockCodes=new Set(rows.map(x=>x.code));
