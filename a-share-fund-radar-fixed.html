@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b1220">
+<title>A股资金雷达·增强版</title>
+<style>
+html,body{margin:0;width:100%;height:100%;background:#0b1220;color:#eef4ff;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+#msg{padding:22px;line-height:1.7}
+iframe{display:block;border:0;width:100%;height:100%;min-height:100vh}
+</style>
+</head>
+<body>
+<div id="msg">正在加载 A股资金雷达增强版…</div>
+
+<!-- 增强逻辑以文本载入，再注入原雷达页面，避免覆盖原有龙头连板模块。 -->
+<script id="enhancement-code" type="text/plain">
+(function(){
+'use strict';
+const E=id=>document.getElementById(id);
+const STORE_ARCHIVE='radarArchiveV2';
+const STORE_EVENTS='radarEventsV2';
+const STORE_POOL='radarLimitPoolsV2';
+const STORE_REPORT='radarDailyReportV2';
+let boardStocks=[],lastStockCode='',poolCache=null,newsRequest=0,poolAttemptAt=0;
+const stripTags=s=>String(s??'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();
+function eRead(k,d){try{return JSON.parse(localStorage.getItem(k)||'null')??d}catch{return d}}
+function eWrite(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true}catch(e){return false}}
+function cnDate(){return new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date()).replace(/-/g,'')}
+function cnClock(){return Number(new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date()).replace(':',''))}
+function fmtTime(t){return new Date(t).toLocaleTimeString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'})}
+function safeUrl(s){try{const u=new URL(String(s));return /^https?:$/.test(u.protocol)?u.href:''}catch{return ''}}
+function nCode(s){return String(s??'').replace(/\D/g,'').slice(-6)}
+function numMoney(n){return Number.isFinite(+n)?money(+n):'—'}
+function atMinutes(h,mins,now){
+ const target=now-mins*60000;
+ for(let i=h.length-1;i>=0;i--)if(h[i]&&h[i].t<=target)return h[i];
+ return null;
+}
+function pushEvent(ev){
+ const a=eRead(STORE_EVENTS,[]);
+ const key=ev.code+'|'+ev.title;
+ const last=a.find(x=>x.key===key&&Date.now()-x.t<10*60000);
+ if(last)return;
+ a.push({...ev,key,t:Date.now()});
+ eWrite(STORE_EVENTS,a.slice(-160));
+}
+function renderPhasePanel(list){
+ const box=E('enhPhaseRows');if(!box)return;
+ const counts={蓄势:0,启动:0,扩散:0,退潮:0,观察:0};
+ list.forEach(x=>counts[x.phase]=(counts[x.phase]||0)+1);
+ ['蓄势','启动','扩散','退潮','观察'].forEach(k=>{const el=E('phase_'+k);if(el)el.textContent=counts[k]||0});
+ const rank={退潮:0,扩散:1,启动:2,蓄势:3,观察:4};
+ const chosen=[...list].filter(x=>x.phase!=='观察').sort((a,b)=>(rank[a.phase]-rank[b.phase])||b.score-a.score).slice(0,8);
+ box.innerHTML=chosen.length?chosen.map(x=>{
+  const f5=x.flow5===null?'积累中':numMoney(x.flow5);
+  const f15=x.flow15===null?'积累中':numMoney(x.flow15);
+  return `<div class="alert ${x.phase==='退潮'?'critical':x.phase==='扩散'||x.phase==='启动'?'good':''}">
+   <b>${safe(x.name)} · ${safe(x.phase)}</b>
+   <p>涨幅 ${pct(x.change)} · 主力净流入 ${money(x.net)} · 扩散度 ${Number.isFinite(x.breadth)?pct(x.breadth*100):'—'}</p>
+   <p>5分读数变化 ${safe(f5)} · 15分读数变化 ${safe(f15)} · 强度 ${x.score}</p>
+  </div>`;
+ }).join(''):'<div class="empty">目前没有达到阶段观察条件的板块，或历史快照尚未积累。</div>';
+ const total=E('phaseTotal');if(total)total.textContent='阶段识别 '+list.length+' 个板块';
+}
+function renderEventArchive(){
+ const box=E('enhEventRows');if(!box)return;
+ const a=eRead(STORE_EVENTS,[]).slice(-8).reverse();
+ box.innerHTML=a.length?a.map(x=>`<div class="alert ${x.tone==='risk'?'critical':'good'}"><b>${safe(x.name)} · ${safe(x.title)}</b><p>${safe(x.desc)} · ${fmtTime(x.t)}</p>${Number.isFinite(x.r30)?`<p>30分钟后板块涨跌幅变化：${pct(x.r30)}个百分点</p>`:''}${Number.isFinite(x.r60)?`<p>60分钟后板块涨跌幅变化：${pct(x.r60)}个百分点</p>`:''}</div>`).join(''):'<div class="empty">尚无已记录的阶段切换或风险事件。</div>';
+}
+function renderSnapshots(){
+ const box=E('enhSnapshotRows');if(!box)return;
+ const a=eRead(STORE_ARCHIVE,[]).slice(-8).reverse();
+ box.innerHTML=a.length?a.map(s=>{
+  const top=(s.items||[]).slice(0,4).map(x=>`${safe(x.name)} ${safe(x.phase)}（${pct(x.change)}）`).join('；');
+  return `<div class="alert"><b>${safe(s.kind==='industry'?'行业':'概念')}快照 · ${fmtTime(s.t)}</b><p>${top||'无重点板块'}</p><p>${(s.items||[]).slice(0,4).map(x=>`30分 ${Number.isFinite(x.r30)?pct(x.r30)+'pp':'待观察'} / 60分 ${Number.isFinite(x.r60)?pct(x.r60)+'pp':'待观察'}`).join(' · ')}</p></div>`;
+ }).join(''):'<div class="empty">历史快照会在看板运行期间每5分钟留存一次。</div>';
+}
+function renderDailyReport(rep){
+ const box=E('enhDailyReport');if(!box)return;
+ if(!rep){box.innerHTML='<div class="empty">每日15:10后根据当日实际行情快照生成复盘。请保持看板打开以积累盘中数据。</div>';return}
+ const row=(title,a)=>`<div class="alert"><b>${title}</b><p>${(a||[]).map(x=>`${safe(x.name)} ${pct(x.change)} / ${money(x.net)}`).join('；')||'暂无有效数据'}</p></div>`;
+ box.innerHTML=`<div class="summary"><span>复盘日期：<b>${safe(rep.day)}</b></span><span>数据更新时间：<b>${safe(rep.time)}</b></span><span>板块数量：<b>${rep.count}</b></span><span>净流入板块：<b>${rep.positive}</b></span><span>净流出板块：<b>${rep.negative}</b></span><span>强势板块：<b>${rep.strong}</b></span><span>资金背离：<b>${rep.divergence}</b></span></div>
+ <div class="enh-grid">${row('资金净流入前五',rep.topIn)}${row('资金净流出前五',rep.topOut)}${row('高强度板块前五',rep.topScore)}${row('价量背离重点',rep.divs)}</div>
+ <div class="muted">阶段分布：蓄势 ${rep.phases.蓄势||0} · 启动 ${rep.phases.启动||0} · 扩散 ${rep.phases.扩散||0} · 退潮 ${rep.phases.退潮||0} · 观察 ${rep.phases.观察||0}。涨停/炸板池：${rep.zt===null?'不可用':rep.zt+'只涨停'} / ${rep.zb===null?'不可用':rep.zb+'只炸板'}。</div>`;
+}
+function archiveSnapshot(list){
+ const now=Date.now(),day=cnDate(),a=eRead(STORE_ARCHIVE,[]);
+ const prev=a.at(-1);
+ if(prev&&prev.day===day&&prev.kind===kind&&now-prev.t<5*60000)return;
+ const uniq=new Map();
+ const picks=[
+  ...[...list].sort((x,y)=>y.net-x.net).slice(0,5),
+  ...[...list].sort((x,y)=>x.net-y.net).slice(0,5),
+  ...[...list].sort((x,y)=>y.score-x.score).slice(0,4),
+  ...list.filter(x=>x.divergence).slice(0,3)
+ ];
+ picks.forEach(x=>uniq.set(x.code,{code:x.code,name:x.name,change:x.change,net:x.net,score:x.score,phase:x.phase,kind,day,t:now}));
+ a.push({day,kind,t:now,items:[...uniq.values()]});
+ eWrite(STORE_ARCHIVE,a.slice(-500));
+}
+function updateOutcomes(list){
+ const map=new Map(list.map(x=>[x.code,x]));
+ const a=eRead(STORE_ARCHIVE,[]),now=Date.now();
+ let changed=false;
+ for(const s of a){
+  if(s.kind!==kind)continue;
+  const age=now-s.t;
+  for(const item of (s.items||[])){
+   const x=map.get(item.code);if(!x)continue;
+   if(age>=30*60000&&!Number.isFinite(item.r30)){item.r30=+(x.change-item.change).toFixed(2);changed=true}
+   if(age>=60*60000&&!Number.isFinite(item.r60)){item.r60=+(x.change-item.change).toFixed(2);changed=true}
+  }
+ }
+ if(changed)eWrite(STORE_ARCHIVE,a);
+}
+async function loadPools(){
+ const day=cnDate();
+ if(poolCache&&poolCache.day===day)return poolCache;
+ const saved=eRead(STORE_POOL,null);
+ if(saved&&saved.day===day){poolCache=saved;return saved}
+ if(Date.now()-poolAttemptAt<90000)return poolCache||{day,zt:null,zb:null};
+ poolAttemptAt=Date.now();
+ const base='https://push2ex.eastmoney.com/';
+ const common='?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt&Pageindex=0&pagesize=200&sort=fbt%3Aasc&date='+day;
+ const results=await Promise.allSettled([
+  jsonp(base+'getTopicZTPool'+common,12000),
+  jsonp(base+'getTopicZBPool'+common,12000)
+ ]);
+ const zt=results[0].status==='fulfilled'&&Array.isArray(results[0].value?.data?.pool)?results[0].value.data.pool:null;
+ const zb=results[1].status==='fulfilled'&&Array.isArray(results[1].value?.data?.pool)?results[1].value.data.pool:null;
+ poolCache={day,zt:zt?zt.map(p=>({c:nCode(p.c),n:p.n,lbc:+p.lbc||1,zbc:+p.zbc||0})):null,zb:zb?zb.map(p=>({c:nCode(p.c),n:p.n,zbc:+p.zbc||0,lbc:+p.lbc||1})):null};
+ if(zt||zb)eWrite(STORE_POOL,poolCache);
+ return poolCache;
+}
+function renderSectorStats(a,total,pools){
+ const box=E('enhSectorStats');if(!box)return;
+ const up=a.filter(x=>+x.f3>0),down=a.filter(x=>+x.f3<0);
+ const pos=a.filter(x=>+x.f62>0).sort((x,y)=>+y.f62-(+x.f62));
+ const totalIn=pos.reduce((s,x)=>s+(+x.f62||0),0);
+ const top3=pos.slice(0,3).reduce((s,x)=>s+(+x.f62||0),0);
+ const leader=[...a].sort((x,y)=>(+y.f3)-(+x.f3))[0];
+ const flowLeader=pos[0];
+ const codes=new Set(a.map(x=>nCode(x.f12)));
+ const zt=pools?.zt?pools.zt.filter(x=>codes.has(x.c)):null;
+ const zb=pools?.zb?pools.zb.filter(x=>codes.has(x.c)):null;
+ const lim=zt?zt.length:null,breaks=zb?zb.length:null;
+ const second=zt?zt.filter(x=>x.lbc>1).length:null;
+ const coverage=Number.isFinite(+total)&&+total>a.length?`${a.length}/${total}只（样本）`:`${a.length}只`;
+ box.innerHTML=`<div class="summary">
+ <span>成分股上涨：<b class="up">${up.length}</b></span><span>下跌：<b class="down">${down.length}</b></span>
+ <span>样本上涨占比：<b>${a.length?pct(up.length/a.length*100):'—'}</b></span>
+ <span>资金前三集中度：<b>${totalIn>0?pct(top3/totalIn*100):'—'}</b></span>
+ <span>涨停匹配：<b>${lim===null?'不可用':lim+'只'}</b></span>
+ <span>其中连板：<b>${second===null?'不可用':second+'只'}</b></span>
+ <span>炸板匹配：<b>${breaks===null?'不可用':breaks+'只'}</b></span>
+ </div>
+ <div class="enh-grid">
+ <div class="alert"><b>涨幅领涨股</b><p>${leader?safe(leader.f14)+' '+pct(+leader.f3):'—'}</p></div>
+ <div class="alert"><b>资金流入靠前</b><p>${flowLeader?safe(flowLeader.f14)+' '+money(+flowLeader.f62):'—'}</p></div>
+ <div class="alert"><b>样本覆盖</b><p>${safe(coverage)} · 供应商成分股列表返回范围</p></div>
+ </div>
+ <div class="muted">涨停/炸板为东方财富专题池与当前已返回成分股代码交集；若成分股未完整返回，统计只代表样本，不等同于整个板块全量。板块上涨家数占比仍以板块行情接口字段为主。</div>`;
+ if(breaks!==null&&breaks>=2&&breaks>(lim||0))pushEvent({code:selected.code,name:selected.name,title:'炸板分歧偏高',desc:`成分股样本内炸板 ${breaks} 只，当前涨停 ${lim||0} 只`,tone:'risk'});
+}
+function drawStockCurve(canvas,curve){
+ const r=canvas.getBoundingClientRect(),d=window.devicePixelRatio||1,w=Math.max(300,r.width),h=210;
+ canvas.width=w*d;canvas.height=h*d;const c=canvas.getContext('2d');c.setTransform(d,0,0,d,0,0);c.clearRect(0,0,w,h);
+ const v=curve.map(p=>p.v),mi=Math.min(0,...v),ma=Math.max(0,...v),span=ma-mi||1,pad={l:58,r:10,t:12,b:28},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b;
+ const px=i=>pad.l+i/Math.max(1,v.length-1)*cw,py=n=>pad.t+(ma-n)/span*ch;
+ c.font='10px sans-serif';for(let i=0;i<=4;i++){const n=ma-(ma-mi)*i/4,y=py(n);c.strokeStyle='#293951';c.beginPath();c.moveTo(pad.l,y);c.lineTo(w-pad.r,y);c.stroke();c.fillStyle='#91a1b8';c.textAlign='right';c.fillText(money(n),pad.l-5,y+3)}
+ c.strokeStyle='#f0bd64';c.lineWidth=2;c.beginPath();v.forEach((n,i)=>i?c.lineTo(px(i),py(n)):c.moveTo(px(i),py(n)));c.stroke();
+ c.fillStyle='#91a1b8';c.textAlign='center';for(let i=0;i<Math.min(5,v.length);i++){const j=Math.round(i*(v.length-1)/Math.max(1,Math.min(5,v.length)-1));c.fillText(curve[j].time.slice(-5),px(j),h-8)}
+}
+async function showStockFund(code,name){
+ const panel=E('enhStockFlow');if(!panel)return;
+ const clean=nCode(code);
+ lastStockCode=clean;
+ panel.classList.remove('hidden');
+ E('enhStockTitle').textContent=name+'（'+clean+'）· 分时资金曲线';
+ E('enhStockMeta').textContent='正在获取个股分钟资金数据…';
+ E('enhStockLatest').textContent='—';E('enhStockTotal').textContent='—';
+ const market=/^[569]/.test(clean)?'1':/^[03]/.test(clean)?'0':'';
+ if(!market){E('enhStockMeta').textContent='暂不支持该市场代码的分时资金接口，未生成模拟曲线。';return}
+ try{
+  const u=FLOW+'?ut=bd1d9ddb04089700cf9c27f6f7426281&secid='+market+'.'+clean+'&klt=1&lmt=240';
+  const j=await get(u),k=j?.data?.klines;
+  if(j?.rc!==0||!Array.isArray(k)||!k.length)throw Error('分钟资金接口没有返回有效序列');
+  const pts=k.map(line=>{const p=String(line).split(',');return{time:p[0],net:+p[1]}}).filter(p=>p.time&&Number.isFinite(p.net));
+  if(!pts.length)throw Error('分钟数据为空');
+  let sum=0;const curve=pts.map(p=>(sum+=p.net,{time:p.time,v:sum}));
+  E('enhStockLatest').textContent=money(pts.at(-1).net);
+  E('enhStockTotal').textContent=money(sum);
+  E('enhStockMeta').textContent=`数据点 ${pts.length} · ${pts[0].time} 至 ${pts.at(-1).time} · 东方财富供应商估算口径`;
+  drawStockCurve(E('enhStockChart'),curve);
+ }catch(err){E('enhStockMeta').textContent='个股资金曲线暂不可用：'+(err?.message||String(err))+'。不显示模拟曲线。'}
+}
+async function loadSectorNews(){
+ if(!selected)return;
+ const req=++newsRequest,box=E('enhNewsRows');if(!box)return;
+ box.innerHTML='<div class="empty">正在检索板块相关新闻…</div>';
+ try{
+  const param={uid:'',keyword:selected.name,type:['cmsArticleWebOld'],client:'web',clientType:'web',clientVersion:'curr',param:{cmsArticleWebOld:{searchScope:'default',sort:'default',pageIndex:1,pageSize:8,preTag:'',postTag:''}}};
+  const url='https://search-api-web.eastmoney.com/search/jsonp?param='+encodeURIComponent(JSON.stringify(param));
+  const data=await jsonp(url,12000);if(req!==newsRequest)return;
+  const a=data?.result?.cmsArticleWebOld||[];
+  if(!a.length){box.innerHTML='<div class="empty">当前没有检索到相关新闻；不能据此判断没有政策或公告催化。</div>';return}
+  box.innerHTML=a.slice(0,8).map(x=>{
+   const title=stripTags(x.title),content=stripTags(x.content).slice(0,100),url=safeUrl(x.url);
+   const type=/国务院|发改委|工信部|证监会|财政部|政策|通知|意见|规划|公告|批复/.test(title)?'政策/公告关键词':'行业资讯';
+   return `<div class="alert"><b>${safe(type)} · ${safe(title)}</b><p>${safe(x.date||'时间未知')} · ${safe(x.mediaName||'来源未知')}</p><p>${safe(content)}</p>${url?`<p><a href="${safe(url)}" target="_blank" rel="noopener">打开原文核验</a></p>`:''}</div>`;
+  }).join('');
+ }catch(err){if(req===newsRequest)box.innerHTML='<div class="empty">新闻检索暂不可用：'+safe(err?.message||String(err))+'</div>'}
+}
+async function loadSectorExtras(){
+ try{
+  const pools=await loadPools();
+  if(selected&&boardStocks.length)renderSectorStats(boardStocks,boardStocks._total,pools);
+ }catch(e){if(E('enhSectorStats'))E('enhSectorStats').textContent='涨停/炸板专题数据暂不可用。'}
+ loadSectorNews();
+}
+function enhanceStocksFunction(){
+ const original=stocks;
+ stocks=async function(){
+  if(!selected)return;
+  E('stockMeta').textContent='正在读取成分股…';
+  try{
+   const u=API+'?pn=1&pz=200&po=1&np=1&fltt=2&invt=2&fid=f62&fs='+encodeURIComponent('b:'+selected.code)+'&fields=f12,f14,f2,f3,f6,f62';
+   const j=await get(u),a=arr(j?.data?.diff);
+   if(!a)throw Error('成分股接口格式异常');
+   const total=+(j?.data?.total||a.length);
+   boardStocks=a;boardStocks._total=total;
+   E('stockRows').innerHTML=a.map(x=>`<tr class="stockpick" data-code="${safe(x.f12)}" data-name="${safe(x.f14)}"><td>${safe(x.f14)}<br><span class="muted">${safe(x.f12)} · 点击看分时资金</span></td><td class="${cls(+x.f3)}">${pct(+x.f3)}</td><td>${Number.isFinite(+x.f2)?(+x.f2).toFixed(2):'—'}</td><td>${money(+x.f6)}</td><td class="${cls(+x.f62)}">${money(+x.f62)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">暂无成分股</td></tr>';
+   document.querySelectorAll('.stockpick').forEach(r=>r.onclick=()=>showStockFund(r.dataset.code,r.dataset.name));
+   E('stockMeta').textContent=`返回 ${a.length}/${total} 只 · 供应商成分股列表 · 点击个股查看分钟资金曲线`;
+   const p=await loadPools();renderSectorStats(a,total,p);
+  }catch(e){E('stockMeta').textContent='读取失败：'+e.message;E('stockRows').innerHTML='<tr><td colspan="5" class="empty">成分股暂不可用</td></tr>';if(E('enhSectorStats'))E('enhSectorStats').textContent='成分股强度统计暂不可用。'}
+ };
+}
+function makeDailyReport(list,pools){
+ const phases={蓄势:0,启动:0,扩散:0,退潮:0,观察:0};list.forEach(x=>phases[x.phase]=(phases[x.phase]||0)+1);
+ return {day:cnDate(),time:fmtTime(Date.now()),kind,count:list.length,positive:list.filter(x=>x.net>0).length,negative:list.filter(x=>x.net<0).length,strong:list.filter(x=>x.score>=80).length,divergence:list.filter(x=>x.divergence).length,phases,
+  topIn:[...list].sort((a,b)=>b.net-a.net).slice(0,5).map(x=>({name:x.name,change:x.change,net:x.net})),
+  topOut:[...list].sort((a,b)=>a.net-b.net).slice(0,5).map(x=>({name:x.name,change:x.change,net:x.net})),
+  topScore:[...list].sort((a,b)=>b.score-a.score).slice(0,5).map(x=>({name:x.name,change:x.change,net:x.net})),
+  divs:list.filter(x=>x.divergence).sort((a,b)=>b.score-a.score).slice(0,5).map(x=>({name:x.name,change:x.change,net:x.net})),
+  zt:pools?.zt?.length??null,zb:pools?.zb?.length??null};
+}
+async function maybeDailyReport(list,force=false){
+ if(cnClock()<1510){renderDailyReport(null);return}
+ const key=STORE_REPORT+'_'+cnDate()+'_'+kind;
+ let rep=eRead(key,null);
+ if(!rep||force){
+  let pools=null;try{pools=await loadPools()}catch{}
+  rep=makeDailyReport(list,pools);eWrite(key,rep);
+ }
+ renderDailyReport(rep);
+}
+function updateEventOutcomes(list){
+ const map=new Map(list.map(x=>[x.code,x])),events=eRead(STORE_EVENTS,[]);let changed=false,now=Date.now();
+ for(const e of events){
+  const x=map.get(e.code);if(!x)continue;
+  if(now-e.t>=30*60000&&!Number.isFinite(e.r30)){e.r30=+(x.change-e.baseChange).toFixed(2);changed=true}
+  if(now-e.t>=60*60000&&!Number.isFinite(e.r60)){e.r60=+(x.change-e.baseChange).toFixed(2);changed=true}
+ }
+ if(changed)eWrite(STORE_EVENTS,events);
+}
+function installUI(){
+ const css=document.createElement('style');
+ css.textContent=`
+ .enh-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:7px;margin-top:9px}
+ .enh-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px;margin:9px 0}
+ .enh-metric{background:#172337;border:1px solid #293951;border-radius:9px;padding:8px}
+ .enh-metric b{display:block;font-size:18px;margin-top:4px}
+ .stockpick{cursor:pointer}.stockpick:active{background:#20324b}
+ #enhStockFlow .chartbox{height:210px}
+ #enhStockFlow canvas{width:100%;height:100%;display:block}
+ .enh-note{color:#91a1b8;font-size:10px;line-height:1.65;margin-top:8px}
+ @media(max-width:650px){.enh-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+ `;
+ document.head.appendChild(css);
+ const listPanel=E('listTitle')?.closest('.panel');
+ if(listPanel&&!E('enhPhasePanel')){
+  listPanel.insertAdjacentHTML('beforebegin',`
+  <section class="panel" id="enhPhasePanel"><div class="panelhead"><div><b>🧭 板块阶段与资金持续性</b><div class="muted">蓄势 / 启动 / 扩散 / 退潮 · 近5/15/30分钟主力净流入读数变化</div></div><span class="tag" id="phaseTotal">等待数据</span></div>
+  <div class="enh-metrics">
+   <div class="enh-metric"><span class="muted">蓄势</span><b id="phase_蓄势">0</b></div>
+   <div class="enh-metric"><span class="muted">启动</span><b id="phase_启动">0</b></div>
+   <div class="enh-metric"><span class="muted">扩散</span><b id="phase_扩散">0</b></div>
+   <div class="enh-metric"><span class="muted">退潮</span><b id="phase_退潮">0</b></div>
+   <div class="enh-metric"><span class="muted">观察</span><b id="phase_观察">0</b></div>
+  </div><div id="enhPhaseRows" class="alerts"><div class="empty">等待行情数据</div></div>
+  <div class="enh-note">持续性采用板块主力净流入字段的历史快照差值估算；不是逐笔资金，也不是交易所真实账户资金。至少积累5分钟快照后才显示5分钟变化。</div></section>
+  <section class="panel" id="enhDailyPanel"><div class="panelhead"><div><b>📊 每日15:10收盘复盘</b><div class="muted">本机监控期间的真实行情快照汇总</div></div><button id="enhDailyRefresh">刷新复盘</button></div><div id="enhDailyReport" class="enh-grid"><div class="empty">等待数据</div></div><div class="enh-note">网页保持打开时，15:10后自动生成；若收盘时网页关闭，只能在下次打开后按可取得的最新数据补生成，无法补回关闭期间未采集的盘中过程。</div></section>
+  <section class="panel" id="enhArchivePanel"><div class="panelhead"><div><b>🗂 异动历史与30/60分钟表现</b><div class="muted">每5分钟保存重点板块快照；事件成熟后回填后续涨跌幅变化</div></div></div><div id="enhSnapshotRows" class="enh-grid"></div><div class="muted" style="margin-top:8px">阶段变化与风险事件</div><div id="enhEventRows" class="enh-grid"></div></section>`);
+ }
+ const stocksPane=E('stocksPane');
+ if(stocksPane&&!E('enhSectorStats')){
+  stocksPane.insertAdjacentHTML('beforeend',`
+   <section class="panel" id="enhSectorPanel"><div class="panelhead"><div><b>🔬 板块内部强度</b><div class="muted">上涨/下跌扩散、领涨股、资金集中度、涨停与炸板匹配</div></div></div><div id="enhSectorStats" class="muted">等待成分股数据</div></section>
+   <section class="panel hidden" id="enhStockFlow"><div class="panelhead"><div><b id="enhStockTitle">个股分时资金曲线</b><button id="enhStockReload">刷新曲线</button></div></div><div class="muted" id="enhStockMeta">点击上方任意成分股查看分钟资金曲线。</div><div class="summary"><span>最新分钟净流入：<b id="enhStockLatest">—</b></span><span>分钟净流入累计：<b id="enhStockTotal">—</b></span></div><div class="chartbox"><canvas id="enhStockChart"></canvas></div><div class="enh-note">东方财富公开资金流接口的供应商估算口径；仅在接口返回有效分钟序列时绘图。</div></section>
+   <section class="panel" id="enhNewsPanel"><div class="panelhead"><div><b>📰 新闻与政策催化线索</b><button id="enhNewsReload">重新检索</button></div></div><div id="enhNewsRows" class="enh-grid"><div class="empty">选中板块后检索相关新闻</div></div><div class="enh-note">新闻搜索结果只是线索。标题关键词分类不等于官方认定，必须打开原文核验发布时间、发布主体和是否属于正式公告；无法验证的市场传闻不会作为已确认催化。</div></section>`);
+  E('enhStockReload').onclick=()=>lastStockCode&&showStockFund(lastStockCode,E('enhStockTitle').textContent.split('（')[0]);
+  E('enhNewsReload').onclick=loadSectorNews;
+ }
+ if(E('enhDailyRefresh'))E('enhDailyRefresh').onclick=()=>current?.length?maybeDailyReport(current,true):null;
+}
+function wrapMakeAlerts(){
+ const base=makeAlerts;
+ makeAlerts=function(list){
+  const before=new Map(list.map(x=>[x.code,(history[x.code]||[]).at(-1)||null]));
+  base(list);
+  const now=Date.now();
+  for(const x of list){
+   let h=history[x.code]||[];
+   let kept=true;
+   if(h.length>1&&h.at(-1).t-h.at(-2).t<55000){h.pop();kept=false}
+   if(kept){
+    const last=h.at(-1),prev=before.get(x.code);
+    if(last){
+     Object.assign(last,{change:x.change,breadth:x.breadth,amount:x.amount,score:x.score,phase:x.phase});
+    }
+    if(prev&&prev.phase!==x.phase&&x.phase!=='观察'){
+     pushEvent({code:x.code,name:x.name,title:'阶段切换：'+x.phase,desc:`阶段由 ${prev.phase||'未识别'} 转为 ${x.phase}；涨幅 ${pct(x.change)}，主力净流入 ${money(x.net)}`,tone:x.phase==='退潮'?'risk':'info',baseChange:x.change});
+    }
+    if(x.phase==='退潮'&&prev?.phase!=='退潮'){
+     pushEvent({code:x.code,name:x.name,title:'退潮风险',desc:'资金读数、板块涨幅与上涨扩散度同时偏弱，需观察是否进一步走弱。',tone:'risk',baseChange:x.change});
+    }
+    if(x.flow5!==null&&x.flow5< -Math.max(20000000,x.amount*.002)&&x.change>1.5){
+     pushEvent({code:x.code,name:x.name,title:'上涨与资金读数背离',desc:`板块仍上涨 ${pct(x.change)}，但近5分钟主力净流入读数变化为 ${money(x.flow5)}。`,tone:'risk',baseChange:x.change});
+    }
+    if(prev&&Number.isFinite(prev.breadth)&&Number.isFinite(x.breadth)&&prev.breadth-x.breadth>.12){
+     pushEvent({code:x.code,name:x.name,title:'上涨扩散快速收窄',desc:`上涨家数占比由 ${pct(prev.breadth*100)} 降至 ${pct(x.breadth*100)}。`,tone:'risk',baseChange:x.change});
+    }
+   }
+   history[x.code]=h.slice(-36);
+  }
+  persist();
+  renderPhasePanel(list);
+  renderEventArchive();
+ };
+}
+function wrapLoad(){
+ const base=load;
+ load=async function(){
+  await base();
+  if(current&&current.length&&E('health')?.className.includes('ok')){
+   archiveSnapshot(current);
+   updateOutcomes(current);
+   updateEventOutcomes(current);
+   renderPhasePanel(current);renderSnapshots();renderEventArchive();
+   maybeDailyReport(current);
+  }
+ };
+}
+function install(){
+ installUI();
+ const base=prepare;
+ // 原页面已有综合评分，这里叠加阶段和历史读数，不覆盖原评分公式。
+ prepare=function(list){
+  const out=base(list);
+  const now=Date.now();
+  for(const x of out){
+   const h=history[x.code]||[];
+   const p5=atMinutes(h,5,now),p15=atMinutes(h,15,now),p30=atMinutes(h,30,now);
+   x.flow5=p5&&Number.isFinite(+p5.net)?x.net-(+p5.net):null;
+   x.flow15=p15&&Number.isFinite(+p15.net)?x.net-(+p15.net):null;
+   x.flow30=p30&&Number.isFinite(+p30.net)?x.net-(+p30.net):null;
+   const b=Number.isFinite(x.breadth)?x.breadth:null;
+   if(x.net<0&&x.change<0&&(b===null||b<.5)&&(x.flow5===null||x.flow5<0))x.phase='退潮';
+   else if(x.net>0&&x.change>=1.5&&b!==null&&b>=.62&&x.score>=68&&(x.flow5===null||x.flow5>0))x.phase='扩散';
+   else if(x.net>0&&x.change>=.5&&x.score>=58&&(x.flow5===null||x.flow5>0||x.streak>=1))x.phase='启动';
+   else if(x.net>0&&x.change<1.8&&(x.flow5===null||x.flow5>=0))x.phase='蓄势';
+   else x.phase='观察';
+   x.signal=x.phase+' · '+x.signal;
+  }
+  return out;
+ };
+ wrapMakeAlerts();
+ enhanceStocksFunction();
+ const oldOpen=openSector;
+ openSector=async function(code,name){
+  await oldOpen(code,name);
+  const panel=E('enhStockFlow');if(panel)panel.classList.add('hidden');
+  loadSectorExtras();
+ };
+ wrapLoad();
+ if(E('enhDailyRefresh'))E('enhDailyRefresh').onclick=()=>current?.length?maybeDailyReport(current,true):null;
+ setInterval(()=>{if(current&&current.length&&E('health')?.className.includes('ok'))maybeDailyReport(current)},15000);
+ setTimeout(()=>{if(current&&current.length&&E('health')?.className.includes('ok')){archiveSnapshot(current);updateOutcomes(current);renderSnapshots();maybeDailyReport(current)}},3500);
+}
+install();
+})();
+</script>
+
+
+<script>
+(async function(){
+  const blobSha = 'bcf795d2502fa703d61be623ea175f54410888d4';
+  const blobUrl = `https://api.github.com/repos/a2423627091/a-share-fund-radar/git/blobs/${blobSha}`;
+  const msg = document.getElementById('msg');
+  try {
+    const response = await fetch(blobUrl, {
+      headers: { Accept: 'application/vnd.github+json' },
+      cache: 'no-store'
+    });
+    if (!response.ok) throw new Error('原始源码读取失败：GitHub API HTTP ' + response.status);
+    const blob = await response.json();
+    if (blob.sha !== blobSha || blob.encoding !== 'base64' || !blob.content) {
+      throw new Error('原始源码校验失败，已停止加载');
+    }
+    const binary = atob(blob.content.replace(/\s/g, ''));
+    const bytes = Uint8Array.from(binary, ch => ch.charCodeAt(0));
+    let html = new TextDecoder('utf-8').decode(bytes);
+
+    if (!html.includes('LADDER_DOC_B64') || !html.includes('navLadder') || !html.includes('function flow()')) {
+      throw new Error('取回的不是包含龙头连板与板块资金曲线的原始版本');
+    }
+    const timerBefore = "load();setInterval(()=>{load();if(selected&&!$('detail').classList.contains('hidden')&&!$('stocksPane').classList.contains('hidden'))stocks()},60000);";
+    const timerAfter  = "load();setInterval(()=>{load();if(selected&&!$('detail').classList.contains('hidden')&&!$('stocksPane').classList.contains('hidden'))stocks()},30000);";
+    const timerCount = html.split(timerBefore).length - 1;
+    if (timerCount !== 1) throw new Error('30秒刷新定位校验失败，停止加载');
+    html = html.replace(timerBefore, timerAfter);
+
+    const patch = document.getElementById('enhancement-code').textContent;
+    if (!patch || html.includes('radarArchiveV2')) throw new Error('增强代码重复注入保护已触发');
+    if (!html.includes('</body>')) throw new Error('原始网页结构不完整');
+    html = html.replace('</body>', '<script>' + patch + '<\/script></body>');
+
+    const frame = document.createElement('iframe');
+    frame.title = 'A股资金雷达增强版';
+    frame.srcdoc = html;
+    document.body.replaceChildren(frame);
+    document.title = 'A股资金雷达增强版';
+  } catch (e) {
+    msg.textContent = '页面加载失败：' + (e && e.message ? e.message : String(e)) +
+      '。未加载不完整页面；请稍后重试。';
+  }
+})();
+</script>
+</body>
